@@ -5,7 +5,7 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net48</TargetFramework>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <AssemblyName>OneCheck</AssemblyName>
+    <AssemblyName>TodaysContracts</AssemblyName>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <LangVersion>latest</LangVersion>
   </PropertyGroup>

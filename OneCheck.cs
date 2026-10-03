@@ -19,8 +19,8 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyTitle("One Check")]
-[assembly: System.Reflection.AssemblyProduct("One Check")]
+[assembly: System.Reflection.AssemblyTitle("Today's Contracts")]
+[assembly: System.Reflection.AssemblyProduct("Today's Contracts")]
 [assembly: System.Reflection.AssemblyVersion("2.0.0.0")]
 
 namespace OneCheck
@@ -40,7 +40,7 @@ namespace OneCheck
             {
                 if (!fresh)
                 {
-                    IntPtr h = FindWindow(null, "One Check");
+                    IntPtr h = FindWindow(null, "Today's Contracts");   // must match MainForm.Text exactly
                     if (h != IntPtr.Zero) { ShowWindow(h, 9); SetForegroundWindow(h); }
                     return;
                 }
@@ -317,6 +317,7 @@ namespace OneCheck
 
         Font fHuge, fMid, fBtn, fMicro, fMicroB, fTask, fTaskSmall, fBody, fCell;
         Font fHugeFit; float fHugeFitSize;   // shrunk copy of fHuge for long day names (cached)
+        Font fTitleFit; float fTitleFitSize; // shrunk copy of fMid if the title bar text would hit the window buttons (cached)
 
         // ---------- data ----------
         readonly Dictionary<string, Day> days = new Dictionary<string, Day>();
@@ -351,7 +352,7 @@ namespace OneCheck
 
         public MainForm()
         {
-            Text = "One Check";
+            Text = "Today's Contracts";   // Program.Main finds the window by this exact title
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterScreen;
             DoubleBuffered = true;
@@ -372,6 +373,7 @@ namespace OneCheck
 
             MakeFonts();
             LoadSettings();
+            FixStartupPath();
             ApplyRotation();
             ApplyTheme();
             LoadDays();
@@ -786,6 +788,22 @@ namespace OneCheck
                     if (k == null) return;
                     if (on) k.SetValue("OneCheck", "\"" + Application.ExecutablePath + "\"");
                     else k.DeleteValue("OneCheck", false);
+                }
+            }
+            catch { }
+        }
+        // the Run entry stores the exe path; if the exe was moved or renamed, point it at this one
+        void FixStartupPath()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true))
+                {
+                    if (k == null) return;
+                    var v = k.GetValue("OneCheck") as string;
+                    if (v == null) return;
+                    if (!string.Equals(v.Trim().Trim('"'), Application.ExecutablePath, StringComparison.OrdinalIgnoreCase))
+                        k.SetValue("OneCheck", "\"" + Application.ExecutablePath + "\"");
                 }
             }
             catch { }
@@ -1354,8 +1372,30 @@ namespace OneCheck
         void PaintTitleBar(Graphics g)
         {
             FillR(g, R(Pad, 14, 10, 10), accent);
-            float w = Wide(g, "ONE CHECK", fMid, cInk, D(Pad + 18), D(11), WIDE);
-            Micro(g, "SYS.02", D(Pad + 18) + w + D(8), D(16), cMuted, false);
+            // keep the title clear of the window buttons: drop the micro label first, then ease the stretch, then shrink
+            const string title = "TODAY'S CONTRACTS";
+            float x0 = D(Pad + 18), room = D(LW - 114 - 10) - x0;
+            Font f = fMid;
+            float sx = WIDE, w = WideW(g, title, f, sx);
+            bool label = w + D(8) + Measure(g, "SYS.02", fMicro).Width <= room;
+            if (w > room)
+            {
+                sx = Math.Max(1f, WIDE * room / w);
+                w = WideW(g, title, f, sx);
+                if (w > room)
+                {
+                    float size = Math.Max(7f, (float)Math.Floor(fMid.Size * room / w * 2f) / 2f);
+                    if (fTitleFit == null || fTitleFitSize != size)
+                    {
+                        if (fTitleFit != null) fTitleFit.Dispose();
+                        fTitleFit = new Font(fMid.FontFamily, size, fMid.Style);
+                        fTitleFitSize = size;
+                    }
+                    f = fTitleFit;
+                }
+            }
+            w = Wide(g, title, f, cInk, x0, D(11) + (fMid.Height - f.Height) / 2f, sx);
+            if (label) Micro(g, "SYS.02", x0 + w + D(8), D(16), cMuted, false);
 
             string[] keys = { "gear", "min", "close" };
             for (int i = 0; i < 3; i++)

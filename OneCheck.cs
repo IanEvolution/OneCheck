@@ -288,7 +288,7 @@ namespace OneCheck
         }
     }
 
-    class MainForm : Form
+    class MainForm : Form, IMessageFilter
     {
         // ---------- look ----------
         static readonly Accent[] Accents = {
@@ -297,12 +297,16 @@ namespace OneCheck
             new Accent("UESC",  "#470BF6"),
             new Accent("NuCaloric", "#F81D78"),
             new Accent("Traxus",  "#FD6C1D"),
+            new Accent("Mida",    "#C6A8FF"),
+            new Accent("Arachne", "#E8102A"),
         };
 
         Color cBg, cPanel, cInk, cMuted, cLine, cHole, cField, cDim;
         Color accent = Accents[0].Color;
         string accentName = "Acid";
         bool dark = true, sound = true, bootSound = true, uiSound = true, onTop = false;
+        bool rotate;                // daily rotation through the Accents presets
+        string rotateShown = "";    // last date the FACTION flash was shown
         byte[] customPunch, customBoot;   // user-chosen WAVs, copied into the data folder
         string punchName = "", bootName = "";
 
@@ -317,7 +321,8 @@ namespace OneCheck
         // ---------- data ----------
         readonly Dictionary<string, Day> days = new Dictionary<string, Day>();
         readonly Dictionary<string, List<Step>> steps = new Dictionary<string, List<Step>>();
-        const int MaxSteps = 8;
+        const int MaxSteps = 50;    // effectively unlimited; just keeps steps.txt sane
+        const int VisibleSteps = 6; // rows shown at once; the list scrolls past this
         readonly List<Routine> routines = new List<Routine>();
         readonly Dictionary<string, List<string>> routineLog = new Dictionary<string, List<string>>(); // id -> dates done
         const int MaxRoutines = 8, MaxRoutineLog = 20;
@@ -335,6 +340,14 @@ namespace OneCheck
         System.Windows.Forms.Timer animTimer, tickTimer, flashTimer;
         string flash = "";
         int frame;
+        int stepScroll;             // index of the first visible step row
+        int wheelAcc;               // leftover wheel delta (precision touchpads send fractions of a notch)
+        bool sbDrag; int sbDragOff; // dragging the steps scrollbar thumb
+        // mini punch when a step is checked, and the punch button unlocking when the last item is
+        const float StepAnimMs = 350f, UnlockMs = 300f;
+        int stepAnimIndex = -1;     // step being stamped, -1 = none
+        DateTime stepAnimStart, unlockStart;   // unlockStart can be in the future: it waits for the step stamp
+        bool unlockOn;
 
         public MainForm()
         {
@@ -359,6 +372,7 @@ namespace OneCheck
 
             MakeFonts();
             LoadSettings();
+            ApplyRotation();
             ApplyTheme();
             LoadDays();
             LoadSteps();
@@ -404,14 +418,19 @@ namespace OneCheck
             txtStep.HandleCreated += (s, e) => Cue(txtStep, "+ Add a step, press Enter");
             txtRoutine.HandleCreated += (s, e) => Cue(txtRoutine, "+ New routine, press Enter");
 
-            // animation timer only runs during the boot wipe and the punch glitch
+            // animation timer only runs during the boot wipe, the punch glitch, a step stamp and the punch unlock
             animTimer = new System.Windows.Forms.Timer { Interval = 16 };
             animTimer.Tick += (s, e) =>
             {
                 frame++;
+                bool was = bootAnim < 1f || punchAnim < 1f;
                 bootAnim = Math.Min(1f, (float)(DateTime.Now - bootStart).TotalMilliseconds / 650f);
                 punchAnim = Math.Min(1f, (float)(DateTime.Now - punchStart).TotalMilliseconds / 520f);
-                if (bootAnim >= 1f && punchAnim >= 1f) { animTimer.Stop(); Relayout(); }
+                if (StepAnim >= 1f) stepAnimIndex = -1;
+                if (UnlockAnim >= 1f) unlockOn = false;
+                bool busy = bootAnim < 1f || punchAnim < 1f;
+                if (was && !busy) Relayout();
+                if (!busy && stepAnimIndex < 0 && !unlockOn) animTimer.Stop();
                 Invalidate();
             };
             // checks once a minute whether the date rolled over; nothing else runs while idle
@@ -419,7 +438,7 @@ namespace OneCheck
             tickTimer.Tick += (s, e) => CheckRollover();
             tickTimer.Start();
             flashTimer = new System.Windows.Forms.Timer { Interval = 1600 };
-            flashTimer.Tick += (s, e) => { flashTimer.Stop(); flash = ""; Invalidate(); };
+            flashTimer.Tick += (s, e) => { flashTimer.Stop(); flashTimer.Interval = 1600; flash = ""; Invalidate(); };
 
             Activated += (s, e) => CheckRollover();
             Shown += (s, e) =>
@@ -427,11 +446,13 @@ namespace OneCheck
                 if (Get(todayKey).Task != "") ActiveControl = null;
                 bootAnim = 0f; punchAnim = 1f; bootStart = DateTime.Now; animTimer.Start();
                 Relayout();
+                AnnounceFaction();
                 if (bootSound) Sfx.Play(customBoot ?? Sfx.Boot, true);
             };
             TopMost = onTop;
             RestorePosition();
             Relayout();
+            Application.AddMessageFilter(this);   // mouse wheel over the steps list, whatever has focus
 #if PREVIEW
             showSettings = Environment.GetEnvironmentVariable("OC_SETTINGS") == "1";
             Relayout();
@@ -491,9 +512,9 @@ namespace OneCheck
             fHuge = TryFont(display, 30f, FontStyle.Bold);
             fMid = TryFont(display, 13f, FontStyle.Bold);
             fBtn = TryFont(display, 15f, FontStyle.Bold);
-            fMicro = TryFont(mono, 6.5f, FontStyle.Regular);
-            fMicroB = TryFont(mono, 6.5f, FontStyle.Bold);
-            fCell = TryFont(mono, 7f, FontStyle.Bold);
+            fMicro = TryFont(mono, 7.5f, FontStyle.Regular);
+            fMicroB = TryFont(mono, 7.5f, FontStyle.Bold);
+            fCell = TryFont(mono, 7.5f, FontStyle.Bold);
             fTask = TryFont(uiSemi, 13f, FontStyle.Regular);
             fTaskSmall = TryFont(uiSemi, 10.5f, FontStyle.Regular);
             fBody = TryFont(ui, 10.5f, FontStyle.Regular);
@@ -713,6 +734,8 @@ namespace OneCheck
             if (customBoot == null) bootName = "";
             if (m.TryGetValue("ui", out v)) uiSound = v != "0";
             if (m.TryGetValue("onTop", out v)) onTop = v == "1";
+            if (m.TryGetValue("rotate", out v)) rotate = v == "1";
+            if (m.TryGetValue("rotateShown", out v)) rotateShown = v;
         }
 
         void SaveSettings()
@@ -730,6 +753,8 @@ namespace OneCheck
                     "bootName=" + bootName,
                     "ui=" + (uiSound ? "1" : "0"),
                     "onTop=" + (onTop ? "1" : "0"),
+                    "rotate=" + (rotate ? "1" : "0"),
+                    "rotateShown=" + rotateShown,
                     "x=" + Left, "y=" + Top,
                 });
             }
@@ -812,7 +837,29 @@ namespace OneCheck
         void CheckRollover()
         {
             string k = Key(DateTime.Today);
-            if (k != todayKey) { todayKey = k; editing = false; Relayout(); }
+            if (k != todayKey) { todayKey = k; editing = false; stepScroll = 0; CancelStepAnim(); ApplyRotation(); AnnounceFaction(); Relayout(); }
+        }
+
+        // daily rotation: today's preset, by days since 2026-01-01 (the custom color is never part of it)
+        void ApplyRotation()
+        {
+            if (!rotate) return;
+            int n = Accents.Length;
+            int i = (int)((DateTime.Today - new DateTime(2026, 1, 1)).TotalDays) % n;
+            if (i < 0) i += n;
+            accent = Accents[i].Color; accentName = Accents[i].Name;
+        }
+
+        // flashes today's faction once per day while rotation is on
+        void AnnounceFaction()
+        {
+            string k = Key(DateTime.Today);
+            if (!rotate || rotateShown == k) return;
+            rotateShown = k;
+            SaveSettings();
+            flash = "FACTION // " + accentName.ToUpperInvariant();
+            flashTimer.Stop(); flashTimer.Interval = 3500; flashTimer.Start();
+            Invalidate();
         }
 
         void SetToday()
@@ -849,6 +896,8 @@ namespace OneCheck
             SaveSteps();
             txtStep.Text = "";
             Sound(Sfx.Save);
+            stepScroll = int.MaxValue;   // Relayout clamps this to the bottom, so the new step is in view
+            CancelStepAnim();
             Relayout();
             if (txtStep.Visible) txtStep.Focus();
         }
@@ -859,14 +908,36 @@ namespace OneCheck
             if (i < 0 || i >= l.Count || Get(todayKey).Done) return;
             l[i].Done = !l[i].Done;
             SaveSteps();
-            if (StepsLeft() == 0 && RoutinesLeft() == 0 && l[i].Done) Sound(Sfx.Save); else Sound(Sfx.Click);
+            bool last = StepsLeft() == 0 && RoutinesLeft() == 0 && l[i].Done;
+            if (last) Sound(Sfx.Save); else Sound(Sfx.Click);
+            CancelStepAnim();   // unchecking is instant, and re-locks the punch button
+            if (l[i].Done)
+            {   // stamp the row if it's on screen; the unlock waits for the stamp to finish
+                bool visible = l.Count <= VisibleSteps || (i >= stepScroll && i < stepScroll + VisibleSteps);
+                if (visible) { stepAnimIndex = i; stepAnimStart = DateTime.Now; }
+                if (last) StartUnlock(visible ? StepAnimMs : 0f);
+                if (visible || last) animTimer.Start();
+            }
             Invalidate();
         }
+
+        // progress of the step stamp / punch unlock, 1 = not running. UnlockAnim is negative while it waits its turn.
+        float StepAnim
+        {
+            get { return stepAnimIndex < 0 ? 1f : Math.Min(1f, (float)(DateTime.Now - stepAnimStart).TotalMilliseconds / StepAnimMs); }
+        }
+        float UnlockAnim
+        {
+            get { return !unlockOn ? 1f : Math.Min(1f, (float)(DateTime.Now - unlockStart).TotalMilliseconds / UnlockMs); }
+        }
+        void StartUnlock(float delayMs) { unlockOn = true; unlockStart = DateTime.Now.AddMilliseconds(delayMs); }
+        void CancelStepAnim() { stepAnimIndex = -1; unlockOn = false; }
 
         void DeleteStep(int i)
         {
             var l = Steps(todayKey);
             if (i < 0 || i >= l.Count || Get(todayKey).Done) return;
+            CancelStepAnim();
             l.RemoveAt(i);
             if (l.Count == 0) steps.Remove(todayKey);
             SaveSteps();
@@ -932,7 +1003,10 @@ namespace OneCheck
             bool nowDone = !l.Contains(todayKey);
             if (nowDone) l.Add(todayKey); else l.Remove(todayKey);
             SaveRoutineLog();
-            if (nowDone && StepsLeft() == 0 && RoutinesLeft() == 0 && Get(todayKey).Task != "") Sound(Sfx.Save); else Sound(Sfx.Click);
+            bool last = nowDone && StepsLeft() == 0 && RoutinesLeft() == 0 && Get(todayKey).Task != "";
+            if (last) Sound(Sfx.Save); else Sound(Sfx.Click);
+            unlockOn = false;
+            if (last) { StartUnlock(0f); animTimer.Start(); }
             Relayout();
         }
 
@@ -985,6 +1059,7 @@ namespace OneCheck
             d.Done = true; d.DoneAt = DateTime.Now.ToString("HH:mm", CultureInfo.InvariantCulture);
             days[todayKey] = d; SaveDays();
             if (sound) Sfx.Play(customPunch ?? Sfx.Punch, true);
+            CancelStepAnim();
             punchAnim = 0f; punchStart = DateTime.Now; animTimer.Start();
             Relayout();
         }
@@ -1005,15 +1080,64 @@ namespace OneCheck
         }
 
         // ---------- layout ----------
-        // The today panel grows with the step list; everything below it shifts down.
+        // The today panel grows with the step list (up to VisibleSteps rows, then the list scrolls);
+        // everything below it shifts down.
         const int TY = 138;          // top of the today panel
         const int RowsTop = 110;     // first step row, relative to TY
         const int RowH = 28;
+        const int SbW = 10;          // strip kept clear on the right of the rows for the scrollbar
 
         bool TaskSet { get { return Get(todayKey).Task != "" && !editing; } }
         bool AddVisible { get { return TaskSet && !Get(todayKey).Done && Steps(todayKey).Count < MaxSteps; } }
-        int AddY { get { return RowsTop + RowH * Steps(todayKey).Count + 2; } }
-        int PunchY { get { return AddVisible ? AddY + 32 + 14 : RowsTop + RowH * Steps(todayKey).Count + 10; } }
+        int StepRows { get { return Math.Min(Steps(todayKey).Count, VisibleSteps); } }
+        int AddY { get { return RowsTop + RowH * StepRows + 2; } }
+        int PunchY { get { return AddVisible ? AddY + 32 + 14 : RowsTop + RowH * StepRows + 10; } }
+
+        // steps list scrolling
+        bool StepsScroll { get { return !showSettings && TaskSet && Steps(todayKey).Count > VisibleSteps; } }
+        Rectangle StepsArea { get { return R(Pad + 14, TY + RowsTop, LW - 2 * Pad - 28, RowH * StepRows); } }
+        Rectangle StepTrack { get { return R(LW - Pad - 14 - 4, TY + RowsTop, 4, RowH * VisibleSteps); } }
+        Rectangle StepThumb
+        {
+            get
+            {
+                var tk = StepTrack;
+                int n = Steps(todayKey).Count, max = Math.Max(1, n - VisibleSteps);
+                int h = Math.Min(tk.Height, Math.Max(D(16), tk.Height * VisibleSteps / Math.Max(1, n)));
+                return new Rectangle(tk.X, tk.Y + (tk.Height - h) * Math.Min(stepScroll, max) / max, tk.Width, h);
+            }
+        }
+
+        void ClampScroll()
+        {
+            stepScroll = Math.Max(0, Math.Min(stepScroll, Math.Max(0, Steps(todayKey).Count - VisibleSteps)));
+        }
+
+        void ScrollTo(int v)
+        {
+            int old = stepScroll;
+            stepScroll = v;
+            ClampScroll();
+            if (stepScroll == old) return;
+            Invalidate();
+            Update();   // repaint now so the hit rects match the new rows, then re-pick what's under the cursor
+            string h = HitAt(PointToClient(Cursor.Position));
+            if (h != hover) { hover = h; Cursor = h == "" ? Cursors.Default : Cursors.Hand; Invalidate(); }
+        }
+
+        // WM_MOUSEWHEEL goes to whichever control has focus (usually a text box), so catch it here instead
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg != 0x020A || !StepsScroll) return false;
+            Control c = Control.FromHandle(m.HWnd);
+            if (c == null || (c != this && c.FindForm() != this)) return false;
+            if (!StepsArea.Contains(PointToClient(Cursor.Position))) return false;
+            wheelAcc += (short)((m.WParam.ToInt64() >> 16) & 0xFFFF);
+            int notches = wheelAcc / 120;
+            wheelAcc -= notches * 120;
+            if (notches != 0) ScrollTo(stepScroll - notches);
+            return true;
+        }
         int TodayH { get { return TaskSet ? PunchY + 60 + (Get(todayKey).Done ? 32 : 16) : 210; } }
         // routine panel sits under today and only takes space when something is listed
         const int RtRowH = 26;
@@ -1024,7 +1148,7 @@ namespace OneCheck
         int MainH { get { return LogY + 224; } }
 
         // config + routines screens
-        const int SettingsH = 740;
+        const int SettingsH = 780;
         const int RRowTop = 138 + 34, RRowH = 52;
         int RListH { get { return routines.Count == 0 ? 26 : RRowH * routines.Count; } }
         int RFieldY { get { return RRowTop + RListH + 6; } }
@@ -1040,6 +1164,7 @@ namespace OneCheck
         void Relayout()
         {
             var t = Get(todayKey);
+            ClampScroll();
             bool booting = bootAnim < 1f;
             bool todayBox = !showSettings && !booting && (t.Task == "" || editing);
             fieldToday = R(Pad + 16, 138 + 46, LW - 2 * Pad - 32 - 88, 42);
@@ -1089,8 +1214,10 @@ namespace OneCheck
             var st = g.Save();
             g.TranslateTransform(x, y);
             g.ScaleTransform(sx, 1f);
+            // ClearType only smooths horizontally, which leaves big stretched type jagged; use grayscale here
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             using (var b = new SolidBrush(c)) g.DrawString(s, f, b, 0, 0, StringFormat.GenericTypographic);
-            g.Restore(st);
+            g.Restore(st);   // also puts the text rendering hint back
             return Measure(g, s, f).Width * sx;
         }
         float WideW(Graphics g, string s, Font f, float sx) { return Measure(g, s, f).Width * sx; }
@@ -1104,22 +1231,26 @@ namespace OneCheck
         float Micro(Graphics g, string s, float x, float y, Color c, bool bold)
         {
             Font f = bold ? fMicroB : fMicro;
+            // whole-pixel origin and advances, so no glyph lands on a half pixel
+            x = (float)Math.Round(x); y = (float)Math.Round(y);
             float cx = x;
             using (var b = new SolidBrush(c))
                 foreach (char ch in s.ToUpperInvariant())
                 {
                     string cs = ch == ' ' ? "i" : ch.ToString();
                     if (ch != ' ') g.DrawString(cs, f, b, cx, y, StringFormat.GenericTypographic);
-                    cx += Measure(g, cs, f).Width + 1.1f * S;
+                    cx += MicroAdv(g, cs, f);
                 }
             return cx - x;
         }
         float MicroW(Graphics g, string s, bool bold)
         {
             Font f = bold ? fMicroB : fMicro; float w = 0;
-            foreach (char ch in s.ToUpperInvariant()) w += Measure(g, ch == ' ' ? "i" : ch.ToString(), f).Width + 1.1f * S;
+            foreach (char ch in s.ToUpperInvariant()) w += MicroAdv(g, ch == ' ' ? "i" : ch.ToString(), f);
             return w;
         }
+        // one character's advance incl. tracking, rounded so Micro and MicroW agree
+        float MicroAdv(Graphics g, string cs, Font f) { return (float)Math.Round(Measure(g, cs, f).Width + 1.1f * S); }
 
         // corner registration brackets
         void Brackets(Graphics g, Rectangle r, Color c, float len)
@@ -1138,7 +1269,7 @@ namespace OneCheck
         void Hazard(Graphics g, Rectangle r, Color stripe, float step)
         {
             var st = g.Save();
-            g.SetClip(r);
+            g.SetClip(r, CombineMode.Intersect);   // stays inside whatever clip the caller already set
             float s = step * S;
             using (var b = new SolidBrush(stripe))
                 for (float x = r.X - r.Height; x < r.Right + r.Height; x += s * 2)
@@ -1192,7 +1323,7 @@ namespace OneCheck
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             hits.Clear();
 
@@ -1351,7 +1482,7 @@ namespace OneCheck
                 float fw = MicroW(g, flash, true);
                 var fr = new Rectangle((int)(c.Right - D(14) - fw - D(8)), c.Y + D(9), (int)(fw + D(8)), D(14));
                 FillR(g, fr, accent);
-                Micro(g, flash, fr.X + D(4), fr.Y + D(3), OnColor(accent), true);
+                Micro(g, flash, fr.X + D(4), fr.Y + D(2), OnColor(accent), true);
             }
             PaintField(g, fieldTomorrow, txtTomorrow.Focused);
             var sv = R(LW - Pad - 16 - 80, NextY + 42, 80, 42);
@@ -1432,45 +1563,117 @@ namespace OneCheck
             float x = D(Pad + 14), y = D(TY + 96);
             float w = Micro(g, "STEPS", x, y, AccentText, true);
             Micro(g, n == 0 ? "// BREAK IT INTO PIECES" : "// " + done.ToString("00") + "/" + n.ToString("00"), x + w + D(6), y, cMuted, false);
-            // progress segments on the right
+            // progress on the right: one segment per step, or a single thin bar once they'd no longer fit
+            // a step that was just checked gets a short stamp animation (see ToggleStep); ai = its index, ms = time in
+            float sa = StepAnim, ms = sa * StepAnimMs;
+            int ai = sa < 1f ? stepAnimIndex : -1;
+            bool segFlash = ai >= 0 && ms < 60f;   // its progress segment blinks ink before settling to accent
             float segW = D(12), segG = D(3), right = D(LW - Pad - 14);
-            for (int i = 0; i < n; i++)
+            if (n > 10)
+            {
+                int bw = (int)(10 * (segW + segG) - segG);
+                var bar = new Rectangle((int)right - bw, (int)y + D(2), bw, D(4));
+                FillR(g, bar, cHole);
+                FillR(g, new Rectangle(bar.X, bar.Y, bar.Width * done / n, bar.Height), segFlash ? cInk : accent);
+            }
+            else for (int i = 0; i < n; i++)
             {
                 float sx = right - (n - i) * (segW + segG) + segG;
-                FillR(g, new Rectangle((int)sx, (int)y + D(1), (int)segW, D(6)), l[i].Done ? accent : cHole);
+                FillR(g, new Rectangle((int)sx, (int)y + D(1), (int)segW, D(6)), !l[i].Done ? cHole : segFlash && i == ai ? cInk : accent);
             }
 
-            for (int i = 0; i < n; i++)
+            // rows: only the visible window is drawn (and hit-tested), each in its slot
+            ClampScroll();
+            bool scroll = n > VisibleSteps;
+            int first = scroll ? stepScroll : 0, last = Math.Min(n, first + VisibleSteps);
+            int above = first, below = n - last;
+            if (scroll) Hit("sbar", R(LW - Pad - 14 - SbW, TY + RowsTop, SbW, RowH * VisibleSteps));
+            var clip = g.Save();
+            g.SetClip(StepsArea);
+            for (int i = first; i < last; i++)
             {
-                var rr = R(Pad + 14, TY + RowsTop + RowH * i, LW - 2 * Pad - 28, RowH);
+                int slot = i - first;
+                var rr = R(Pad + 14, TY + RowsTop + RowH * slot, LW - 2 * Pad - 28 - (scroll ? SbW : 0), RowH);
                 var del = new Rectangle(rr.Right - D(26), rr.Y + D(2), D(24), rr.Height - D(4));
                 bool rowHov = !t.Done && (Hov("step" + i) || Hov("del" + i));
                 if (!t.Done) { Hit("del" + i, del); Hit("step" + i, rr); }
                 if (rowHov) FillR(g, rr, cHole);
 
+                // stamp animation: a scanline sweeps the row left to right, leaving a tint that fades out
+                bool anim = i == ai;
+                float sweepX = rr.Right;
+                if (anim)
+                {
+                    float sp = Math.Min(1f, ms / 280f);
+                    sp = 1 - (1 - sp) * (1 - sp);
+                    sweepX = rr.X + rr.Width * sp;
+                    FillR(g, new Rectangle(rr.X, rr.Y, (int)(sweepX - rr.X), rr.Height), Color.FromArgb((int)(46 * (1 - sa)), accent));
+                }
+
                 var box = new Rectangle(rr.X + D(6), rr.Y + (rr.Height - D(16)) / 2, D(16), D(16));
                 if (l[i].Done)
                 {
+                    var bst = g.Save();
+                    if (anim)
+                    {   // the box lands oversized and snaps down to size
+                        float bp = Math.Min(1f, ms / 200f);
+                        float sc = 1.5f - 0.5f * (1 - (float)Math.Pow(1 - bp, 3));
+                        float bcx = box.X + box.Width / 2f, bcy = box.Y + box.Height / 2f;
+                        g.TranslateTransform(bcx, bcy);
+                        g.ScaleTransform(sc, sc);
+                        g.TranslateTransform(-bcx, -bcy);
+                    }
                     FillR(g, box, accent);
-                    using (var p = new Pen(OnColor(accent), 2f * S) { StartCap = LineCap.Square, EndCap = LineCap.Square })
-                        g.DrawLines(p, new[] { new PointF(box.X + 3.5f * S, box.Y + 8f * S), new PointF(box.X + 6.5f * S, box.Y + 11.5f * S), new PointF(box.X + 12.5f * S, box.Y + 4.5f * S) });
+                    if (!anim || ms >= 80f)
+                        using (var p = new Pen(OnColor(accent), 2f * S) { StartCap = LineCap.Square, EndCap = LineCap.Square })
+                            g.DrawLines(p, new[] { new PointF(box.X + 3.5f * S, box.Y + 8f * S), new PointF(box.X + 6.5f * S, box.Y + 11.5f * S), new PointF(box.X + 12.5f * S, box.Y + 4.5f * S) });
+                    g.Restore(bst);
                 }
                 else using (var p = new Pen(cInk, 1.5f * S)) g.DrawRectangle(p, box.X, box.Y, box.Width - 1, box.Height - 1);
 
                 var tr = new Rectangle(box.Right + D(10), rr.Y, rr.Width - D(32) - D(30), rr.Height);
-                Color tc = l[i].Done ? cMuted : cInk;
-                TextIn(g, l[i].Text, fBody, tc, tr, StringAlignment.Near, StringAlignment.Center);
-                if (l[i].Done)
+                // "more above / below" hint in the corner of the first / last visible row; the row text makes room for it
+                string hint = slot == 0 && above > 0 ? "+" + above + " UP"
+                            : slot == VisibleSteps - 1 && below > 0 ? "+" + below + " MORE" : "";
+                if (hint != "")
                 {
-                    float tw = Math.Min(tr.Width, g.MeasureString(l[i].Text, fBody).Width - D(4));
-                    using (var p = new Pen(cMuted, 1.2f * S)) g.DrawLine(p, tr.X + D(2), rr.Y + rr.Height / 2f + D(1), tr.X + tw, rr.Y + rr.Height / 2f + D(1));
+                    float hw = MicroW(g, hint, false);
+                    Micro(g, hint, tr.Right - hw, slot == 0 ? rr.Y + D(3) : rr.Bottom - D(12), cMuted, false);
+                    tr.Width -= (int)hw + D(8);
                 }
+                Color tc = l[i].Done ? cMuted : cInk;
+                var tt = tr;
+                if (anim && ms < 120f)
+                {   // brief glitch: small jitter + RGB split, a quieter version of PaintComplete's
+                    var rnd = new Random(frame * 7919 + i);
+                    tt.Offset((int)Math.Round((rnd.NextDouble() * 2 - 1) * 1.5f * S), 0);
+                    var tl = tt; tl.Offset(-D(2), 0);
+                    var tg = tt; tg.Offset(D(2), 0);
+                    TextIn(g, l[i].Text, fBody, Color.FromArgb(120, Hex("#FF2E88")), tl, StringAlignment.Near, StringAlignment.Center);
+                    TextIn(g, l[i].Text, fBody, Color.FromArgb(120, Hex("#19E3FF")), tg, StringAlignment.Near, StringAlignment.Center);
+                }
+                TextIn(g, l[i].Text, fBody, tc, tt, StringAlignment.Near, StringAlignment.Center);
+                if (l[i].Done)
+                {   // strike-through; while animating it only reaches as far as the scanline
+                    float tw = Math.Min(tr.Width, g.MeasureString(l[i].Text, fBody).Width - D(4));
+                    float x0 = tr.X + D(2), x1 = Math.Min(tr.X + tw, sweepX);
+                    if (x1 > x0)
+                        using (var p = new Pen(cMuted, 1.2f * S)) g.DrawLine(p, x0, rr.Y + rr.Height / 2f + D(1), x1, rr.Y + rr.Height / 2f + D(1));
+                }
+                if (anim && ms < 280f) FillR(g, new Rectangle(Math.Max(rr.X, (int)sweepX - D(3)), rr.Y, D(3), rr.Height), accent);
                 if (rowHov)
                 {
                     Color xc = Hov("del" + i) ? Hex("#FF3B30") : cMuted;
                     float cx = del.X + del.Width / 2f, cy = del.Y + del.Height / 2f, u = 4f * S;
                     using (var p = new Pen(xc, 1.6f * S)) { g.DrawLine(p, cx - u, cy - u, cx + u, cy + u); g.DrawLine(p, cx - u, cy + u, cx + u, cy - u); }
                 }
+            }
+            g.Restore(clip);
+
+            if (scroll)
+            {
+                FillR(g, StepTrack, cHole);
+                FillR(g, StepThumb, Hov("sbar") || sbDrag ? cInk : accent);
             }
 
             if (AddVisible) PaintField(g, fieldStep, txtStep.Focused);
@@ -1505,7 +1708,7 @@ namespace OneCheck
                 else using (var p = new Pen(late ? red : cInk, 1.5f * S)) g.DrawRectangle(p, box.X, box.Y, box.Width - 1, box.Height - 1);
 
                 float tgw = MicroW(g, tag, true);
-                Micro(g, tag, rr.Right - D(8) - tgw, rr.Y + D(9), late ? red : on ? cMuted : AccentText, true);
+                Micro(g, tag, rr.Right - D(8) - tgw, rr.Y + D(8), late ? red : on ? cMuted : AccentText, true);
 
                 var tr = new Rectangle(box.Right + D(10), rr.Y, (int)(rr.Right - D(18) - tgw - box.Right - D(10)), rr.Height);
                 TextIn(g, r.Text, fBody, on ? cMuted : cInk, tr, StringAlignment.Near, StringAlignment.Center);
@@ -1522,7 +1725,9 @@ namespace OneCheck
             var pb = R(Pad + 14, TY + PunchY, LW - 2 * Pad - 28, 60);
             Hit("punch", pb);
             int ls = StepsLeft(), lr = RoutinesLeft();
-            if (ls + lr > 0)
+            bool locked = ls + lr > 0;
+            float ua = locked ? 1f : UnlockAnim;   // < 0 waiting for the step stamp, 0..1 unlocking, 1 = idle
+            if (locked || ua < 1f)
             {   // locked: every step and listed routine has to be checked first
                 FillR(g, pb, cHole);
                 LineR(g, pb, cDim, 1.2f * S);
@@ -1531,16 +1736,41 @@ namespace OneCheck
                 string l = "";
                 if (ls > 0) l = ls.ToString("00") + (ls == 1 ? " STEP" : " STEPS");
                 if (lr > 0) l += (l != "" ? " + " : "") + lr.ToString("00") + (lr == 1 ? " CHORE" : " CHORES");
-                l += " LEFT";
+                l += l == "" ? "00 LEFT" : " LEFT";
                 Micro(g, l, pb.X + D(16), pb.Bottom - D(14), cMuted, true);
+                if (locked || ua < 0f) return;
+
+                // unlock: ink flash, then the ready button wipes in from the left while the hazard cap slides in from the right
+                if (ua < 0.25f) { FillR(g, pb, cInk); return; }
+                float wp = 1 - (float)Math.Pow(1 - (ua - 0.25f) / 0.75f, 3);
+                int ww = (int)(pb.Width * wp), off = (int)(D(58) * (1 - wp));
+                var st = g.Save();
+                g.SetClip(new Rectangle(pb.X, pb.Y, ww, pb.Height));
+                PaintPunchFace(g, pb, false, false);
+                g.Restore(st);
+                var cap = new Rectangle(pb.Right - D(58) + off, pb.Y, D(58) - off, pb.Height);
+                if (cap.Width > 0)
+                {
+                    st = g.Save();
+                    g.SetClip(cap);
+                    FillR(g, cap, accent);
+                    Hazard(g, new Rectangle(cap.X, cap.Y, D(58), cap.Height), Color.FromArgb(70, OnColor(accent)), 7);
+                    g.Restore(st);
+                }
+                FillR(g, new Rectangle(Math.Min(pb.Right - D(3), pb.X + ww), pb.Y, D(3), pb.Height), cInk);
                 return;
             }
-            bool hv = Hov("punch");
+            PaintPunchFace(g, pb, Hov("punch"), true);
+        }
+
+        // the ready-to-punch button; the unlock animation draws it without the hazard cap and adds that itself
+        void PaintPunchFace(Graphics g, Rectangle pb, bool hv, bool hazard)
+        {
             FillR(g, pb, hv ? cInk : accent);
             Color ink = hv ? OnColor(cInk) : OnColor(accent);
             // hazard end cap
             var hz = new Rectangle(pb.Right - D(58), pb.Y, D(58), pb.Height);
-            Hazard(g, hz, Color.FromArgb(hv ? 60 : 70, ink), 7);
+            if (hazard) Hazard(g, hz, Color.FromArgb(hv ? 60 : 70, ink), 7);
             WideCenterV(g, "PUNCH IT", fBtn, ink, pb.X + D(16), pb, WIDE + 0.1f);
             Chevrons(g, pb.Right - D(96), pb.Y + pb.Height / 2f, ink, 3);
             Micro(g, "CTRL+ENTER", pb.X + D(16), pb.Bottom - D(14), Color.FromArgb(150, ink), false);
@@ -1586,15 +1816,15 @@ namespace OneCheck
 
             // status line + undo
             float y = PanToday.Bottom - D(16);
-            string msg = "LOGGED " + DateTime.Today.ToString("dd.MM", CultureInfo.InvariantCulture) + "  //  STREAK " + streak.ToString("00");
+            string msg = "LOGGED " + DateTime.Today.ToString("dd.MM", CultureInfo.InvariantCulture) + " // STREAK " + streak.ToString("00");
             if (streak == 3 || streak == 7 || streak == 14 || streak == 30 || streak == 50 || streak == 100)
-                msg += "  //  MILESTONE";
+                msg += " // MILESTONE";   // single-spaced so the longest line still clears UNDO
             Micro(g, msg, box.X, y, a >= 1 ? AccentText : cMuted, true);
             var undo = new Rectangle(box.Right - D(50), (int)y - D(5), D(50), D(18));
             Hit("undo", undo);
             float uw = MicroW(g, "UNDO", false);
             Micro(g, "UNDO", undo.Right - uw, y, Hov("undo") ? cInk : cMuted, false);
-            if (Hov("undo")) using (var p = new Pen(cInk, 1)) g.DrawLine(p, undo.Right - uw, y + D(10), undo.Right, y + D(10));
+            if (Hov("undo")) using (var p = new Pen(cInk, 1)) g.DrawLine(p, undo.Right - uw, y + D(12), undo.Right, y + D(12));
         }
 
         void DrawCompleteText(Graphics g, Rectangle box, string time, Color ink, int jitter)
@@ -1643,12 +1873,12 @@ namespace OneCheck
             FillR(g, new Rectangle(hz.X, hz.Y, D(60), hz.Height), accent);
 
             // accent
-            var c = R(Pad, 138, LW - 2 * Pad, 94);
+            var c = R(Pad, 138, LW - 2 * Pad, 134);
             Panel(g, c, "[A]", "ACCENT");
-            string an = accentName.ToUpperInvariant();
+            string an = (rotate ? "ROTATING // " : "") + accentName.ToUpperInvariant();
             Micro(g, an, c.Right - D(14) - MicroW(g, an, true), c.Y + D(12), AccentText, true);
             int nSw = Accents.Length + 1;
-            float sw = D(38), gap = (c.Width - D(28) - nSw * sw) / (nSw - 1f);
+            float sw = D(32), gap = (c.Width - D(28) - nSw * sw) / (nSw - 1f);
             for (int i = 0; i < Accents.Length + 1; i++)
             {
                 var r = new Rectangle((int)(c.X + D(14) + i * (sw + gap)), c.Y + D(36), (int)sw, (int)sw);
@@ -1671,9 +1901,10 @@ namespace OneCheck
                 else if (Hov(i < Accents.Length ? "acc" + i : "accCustom"))
                     using (var pen = new Pen(cDim, 1.5f * S)) g.DrawRectangle(pen, Rectangle.Inflate(r, D(3), D(3)));
             }
+            PaintToggle(g, "togRotate", "Daily rotation", rotate, c.Y + D(82), c);
 
             // theme
-            c = R(Pad, 242, LW - 2 * Pad, 80);
+            c = R(Pad, 282, LW - 2 * Pad, 80);
             Panel(g, c, "[B]", "THEME");
             float half = (c.Width - D(28) - D(6)) / 2f;
             var rd = new Rectangle(c.X + D(14), c.Y + D(32), (int)half, D(36));
@@ -1683,7 +1914,7 @@ namespace OneCheck
             PaintSeg(g, rl, "LIGHT", !dark, Hov("themeLight"));
 
             // toggles
-            c = R(Pad, 332, LW - 2 * Pad, 252);
+            c = R(Pad, 372, LW - 2 * Pad, 252);
             Panel(g, c, "[C]", "SYSTEM");
             PaintSoundRow(g, true, "Punch sound", sound, punchName, c.Y + D(28), c);
             PaintSoundRow(g, false, "Startup sound", bootSound, bootName, c.Y + D(72), c);
@@ -1692,7 +1923,7 @@ namespace OneCheck
             PaintToggle(g, "togStart", "Open when Windows starts", StartsWithWindows(), c.Y + D(204), c);
 
             // routines: opens its own screen
-            var rb = R(Pad, 594, LW - 2 * Pad, 40);
+            var rb = R(Pad, 634, LW - 2 * Pad, 40);
             Hit("routines", rb);
             bool rh = Hov("routines");
             if (rh) FillR(g, rb, accent); else LineR(g, rb, cInk, 1.5f * S);
@@ -1703,11 +1934,11 @@ namespace OneCheck
             string rc = routines.Count.ToString("00") + " SET";
             Micro(g, rc, rb.Right - D(16) - MicroW(g, rc, true), rb.Y + D(16), rh ? ri : AccentText, true);
 
-            var link = R(Pad, 642, 200, 20);
+            var link = R(Pad, 682, 200, 20);
             Hit("openData", link);
             Micro(g, "OPEN DATA FOLDER  >", link.X, link.Y + D(5), Hov("openData") ? AccentText : cMuted, true);
 
-            PaintBigBtn(g, "back", R(Pad, 668, LW - 2 * Pad, 52), "RETURN");
+            PaintBigBtn(g, "back", R(Pad, 708, LW - 2 * Pad, 52), "RETURN");
         }
 
         // full-width accent button with a hazard end cap (RETURN / BACK)
@@ -1765,7 +1996,7 @@ namespace OneCheck
                     else { FillR(g, ch, hv ? cHole : cField); LineR(g, ch, hv ? cInk : cLine, 1f); }
                     Color ink = on ? OnColor(hv ? cInk : accent) : (hv ? cInk : cMuted);
                     float mw = MicroW(g, dl[d], true) - 1.1f * S;
-                    Micro(g, dl[d], ch.X + (ch.Width - mw) / 2f, ch.Y + D(5), ink, true);
+                    Micro(g, dl[d], ch.X + (ch.Width - mw) / 2f, ch.Y + D(4), ink, true);
                     if (d == todayDow) FillR(g, new Rectangle(ch.X, ch.Bottom + D(2), ch.Width, D(2)), cInk);
                 }
 
@@ -1774,7 +2005,7 @@ namespace OneCheck
                 if (tag != "")
                 {
                     float tw = MicroW(g, tag, true);
-                    Micro(g, tag, c.Right - D(14) - tw, D(y + 32), tag == "OVERDUE" ? red : tag == "DONE" ? cMuted : AccentText, true);
+                    Micro(g, tag, c.Right - D(14) - tw, D(y + 31), tag == "OVERDUE" ? red : tag == "DONE" ? cMuted : AccentText, true);
                 }
             }
 
@@ -1808,7 +2039,7 @@ namespace OneCheck
             Hit(kTog, new Rectangle(sw.X - D(4), y, card.Right - sw.X + D(4), D(44)));
             TextIn(g, label, fBody, cInk, new Rectangle(card.X + D(14), y + D(4), chg.X - card.X - D(20), D(22)), StringAlignment.Near, StringAlignment.Center);
             string src = file == "" ? "BUILT-IN" : "FILE: " + file.ToUpperInvariant();
-            if (src.Length > 22) src = src.Substring(0, 21) + "~";
+            if (src.Length > 19) src = src.Substring(0, 18) + "~";   // leaves room for RESET before the CHANGE button
             float w = Micro(g, src, card.X + D(14), y + D(28), cMuted, false);
             if (file != "")
             {
@@ -1818,7 +2049,7 @@ namespace OneCheck
             }
             if (Hov(kChg)) FillR(g, chg, accent); else LineR(g, chg, cDim, 1.2f * S);
             float mw = MicroW(g, "CHANGE", true);
-            Micro(g, "CHANGE", chg.X + (chg.Width - mw) / 2f, chg.Y + D(7), Hov(kChg) ? OnColor(accent) : cInk, true);
+            Micro(g, "CHANGE", chg.X + (chg.Width - mw) / 2f, chg.Y + D(6), Hov(kChg) ? OnColor(accent) : cInk, true);
             PaintSwitch(g, sw, on);
         }
 
@@ -1831,7 +2062,7 @@ namespace OneCheck
             string st = on ? "ON" : "OFF";
             float mw = MicroW(g, st, true);
             float tx = on ? sw.X + D(6) : sw.Right - D(6) - mw;
-            Micro(g, st, tx, sw.Y + D(7), on ? OnColor(accent) : cMuted, true);
+            Micro(g, st, tx, sw.Y + D(6), on ? OnColor(accent) : cMuted, true);
         }
 
         void PaintToggle(Graphics g, string key, string label, bool on, int y, Rectangle card)
@@ -1849,7 +2080,7 @@ namespace OneCheck
             string st = on ? "ON" : "OFF";
             float mw = MicroW(g, st, true);
             float tx = on ? sw.X + D(6) : sw.Right - D(6) - mw;
-            Micro(g, st, tx, sw.Y + D(7), on ? OnColor(accent) : cMuted, true);
+            Micro(g, st, tx, sw.Y + D(6), on ? OnColor(accent) : cMuted, true);
         }
 
         // ---------- window + input ----------
@@ -1883,6 +2114,13 @@ namespace OneCheck
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            if (sbDrag)
+            {
+                Rectangle tk = StepTrack, th = StepThumb;
+                int span = tk.Height - th.Height, max = Steps(todayKey).Count - VisibleSteps;
+                if (span > 0 && max > 0) ScrollTo((int)Math.Round((e.Y - sbDragOff - tk.Y) * (double)max / span));
+                return;
+            }
             string h = HitAt(e.Location);
             if (h != hover)
             {
@@ -1911,7 +2149,21 @@ namespace OneCheck
                 return;
             }
             if (h == "") { ActiveControl = null; Invalidate(); return; }
+            if (h == "sbar")
+            {   // on the thumb: drag it; above or below it: page
+                var th = StepThumb;
+                if (e.Y < th.Y) ScrollTo(stepScroll - VisibleSteps);
+                else if (e.Y >= th.Bottom) ScrollTo(stepScroll + VisibleSteps);
+                else { sbDrag = true; sbDragOff = e.Y - th.Y; Invalidate(); }
+                return;
+            }
             DoClick(h);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (sbDrag) { sbDrag = false; Invalidate(); }
         }
 
         void DoClick(string h)
@@ -1944,10 +2196,11 @@ namespace OneCheck
                 case "togUi": uiSound = !uiSound; SaveSettings(); Invalidate(); break;
                 case "togTop": onTop = !onTop; TopMost = onTop; SaveSettings(); Invalidate(); break;
                 case "togStart": SetStartWithWindows(!StartsWithWindows()); Invalidate(); break;
+                case "togRotate": rotate = !rotate; ApplyRotation(); SaveSettings(); Invalidate(); break;
                 case "openData": try { Process.Start("explorer.exe", "\"" + dataDir + "\""); } catch { } break;
                 case "accCustom":
                     using (var cd = new ColorDialog { FullOpen = true, Color = accent })
-                        if (cd.ShowDialog(this) == DialogResult.OK) { accent = cd.Color; accentName = "Custom"; SaveSettings(); Invalidate(); }
+                        if (cd.ShowDialog(this) == DialogResult.OK) { accent = cd.Color; accentName = "Custom"; rotate = false; SaveSettings(); Invalidate(); }
                     break;
                 default:
                     int si;
@@ -1966,7 +2219,7 @@ namespace OneCheck
                     {
                         int i;
                         if (int.TryParse(h.Substring(3), out i) && i < Accents.Length)
-                        { accent = Accents[i].Color; accentName = Accents[i].Name; SaveSettings(); Invalidate(); }
+                        { accent = Accents[i].Color; accentName = Accents[i].Name; rotate = false; SaveSettings(); Invalidate(); }
                     }
                     break;
             }
@@ -1989,6 +2242,12 @@ namespace OneCheck
         {
             if (WindowState == FormWindowState.Normal) SaveSettings();
             base.OnFormClosing(e);
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            Application.RemoveMessageFilter(this);
+            base.OnFormClosed(e);
         }
     }
 }
